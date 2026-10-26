@@ -677,6 +677,12 @@ function loadConfig() {
     sessionCwd: file.sessionCwd ?? '',
     // fixed 模式（fork 新增）：mode='fixed' + target=会话 id 时，所有 QQ 会话共用那一条 DSH 会话
     session: { mode: '', target: '', ...(file.session ?? {}) },
+    // 人格来源（fork 新增）：
+    //   bridge = 上游行为（roles/ 角色卡 + 内置的"反AI味/积极性"等文案）
+    //   session = 不注入人格，只给 QQ 的事实（昵称/令牌/状态），人格由会话自己那份决定
+    //   file    = 用 persona.file 指定的 markdown 当人格，替代角色卡
+    // fixed 模式默认 session —— 否则 QQ 里的语气会和会话里的自己打架。
+    persona: { mode: '', file: '', maxChars: 1200, ...(file.persona ?? {}) },
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
@@ -10324,9 +10330,40 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  /** fork：人格来源。bridge=上游自带文案 / session=用会话自己的人格 / file=读指定 markdown */
+  function personaMode() {
+    const m = String(cfg.persona?.mode || '').trim();
+    if (m === 'bridge' || m === 'session' || m === 'file') return m;
+    return fixedTarget() ? 'session' : 'bridge';
+  }
+  let personaFileCache = { path: '', mtime: 0, text: '' };
+  function readPersonaFile() {
+    const p = String(cfg.persona?.file || '').trim();
+    if (!p) return '';
+    try {
+      const st = fs.statSync(p);
+      if (personaFileCache.path !== p || personaFileCache.mtime !== st.mtimeMs) {
+        personaFileCache = { path: p, mtime: st.mtimeMs, text: fs.readFileSync(p, 'utf8') };
+      }
+      const max = Math.max(200, Number(cfg.persona?.maxChars) || 1200);
+      return personaFileCache.text.length > max ? `${personaFileCache.text.slice(0, max)}…` : personaFileCache.text;
+    } catch {
+      return '';
+    }
+  }
+
   function buildWakePromptV2(key, reason) {
-    const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const pMode = personaMode();
+    let roleLine = '';
+    if (pMode === 'file') {
+      const text = readPersonaFile();
+      roleLine = text ? `【人格】下面这些就是你，按这个来，不要换成别的模板：\n${text}\n\n` : '';
+    } else if (pMode === 'session') {
+      roleLine = '【人格】用你自己的身份和说话方式（就是你平时那套），不要因为这次是从 QQ 投递的就变成"群友模板"或客服腔。\n\n';
+    } else {
+      const roleState = readRoleState();
+      roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    }
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -10336,13 +10373,13 @@ async function main() {
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
-    const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    const antiAiLine = pMode === 'bridge' ? '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n' : '';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
+    const proactiveLine = pMode === 'bridge' ? '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n' : '';
     const replyTiming = replyTimingV2(st);
     const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
     const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。【不要靠猜】：等待返回里的 canSleepNow/hint 就是闸门的判断结果——canSleepNow=true 立刻收尾（mark_read 或 set_wake_config）；false 时按 hint 给出的 timeoutMs 一次等满，别用更短的 timeoutMs 去凑（更短的等待不算观察，只会白等一轮）。\n\n`;

@@ -279,5 +279,10 @@
   "session": {
     "mode": "",
     "target": ""
+  },
+  "persona": {
+    "mode": "",
+    "file": "",
+    "maxChars": 1200
   }
 }
